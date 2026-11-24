@@ -73,3 +73,12 @@ jobs:
 
       - name: Project 3C (scheduler region heartbeat + balance-region)
         run: make project3c
+
+      - name: Project 4A (MVCC transaction)
+        run: make project4a
+
+      - name: Project 4B (server: get, prewrite, commit)
+        run: make project4b
+
+      - name: Project 4C (server: scan, txn status, rollback, resolve lock)
+        run: make project4c

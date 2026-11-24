@@ -278,8 +278,58 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
+	c.Lock()
+	defer c.Unlock()
 
+	regionID := region.GetID()
+	affected := make(map[uint64]struct{})
+	for _, peer := range region.GetPeers() {
+		affected[peer.GetStoreId()] = struct{}{}
+	}
+
+	if origin := c.GetRegion(regionID); origin != nil {
+		// Compare the epochs lexicographically: a heartbeat is stale when its
+		// version is older, or when the version is the same but the conf
+		// version is older (a peer change without a range change).
+		if region.GetRegionEpoch() != nil && origin.GetRegionEpoch() != nil {
+			regionEpoch, originEpoch := region.GetRegionEpoch(), origin.GetRegionEpoch()
+			if regionEpoch.GetVersion() < originEpoch.GetVersion() ||
+				(regionEpoch.GetVersion() == originEpoch.GetVersion() &&
+					regionEpoch.GetConfVer() < originEpoch.GetConfVer()) {
+				return errors.Errorf("region %d is stale, cached epoch %v, received epoch %v",
+					regionID, originEpoch, regionEpoch)
+			}
+		}
+		if origin.GetLeader() != nil {
+			affected[origin.GetLeader().GetStoreId()] = struct{}{}
+		}
+		for _, peer := range origin.GetPeers() {
+			affected[peer.GetStoreId()] = struct{}{}
+		}
+	}
+
+	// A region may overlap with cached regions after a split or a merge: the
+	// cached ones are stale as soon as this heartbeat carries a newer range, so
+	// drop them and refresh their stores' statistics. The heartbeat itself is
+	// what the store reports, hence it is always taken as the truth for its own
+	// region ID (a newer cached epoch is the only reason to reject it).
+	overlaps := c.core.GetOverlaps(region)
+	for _, item := range overlaps {
+		if item.GetID() == regionID {
+			continue
+		}
+		if item.GetLeader() != nil {
+			affected[item.GetLeader().GetStoreId()] = struct{}{}
+		}
+		for _, peer := range item.GetPeers() {
+			affected[peer.GetStoreId()] = struct{}{}
+		}
+	}
+
+	c.core.PutRegion(region)
+	for id := range affected {
+		c.updateStoreStatusLocked(id)
+	}
 	return nil
 }
 

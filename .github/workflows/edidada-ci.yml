@@ -70,3 +70,6 @@ jobs:
       - name: Project 3B (all conf change / split cases)
         continue-on-error: true
         run: go test -v --count=1 --parallel=1 -p=1 -timeout 30m ./kv/test_raftstore -run '3B$'
+
+      - name: Project 3C (scheduler region heartbeat + balance-region)
+        run: make project3c

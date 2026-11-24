@@ -77,8 +77,8 @@ jobs:
       - name: Project 4A (MVCC transaction)
         run: make project4a
 
-      - name: Project 4B (server: get, prewrite, commit)
+      - name: "Project 4B (server: get, prewrite, commit)"
         run: make project4b
 
-      - name: Project 4C (server: scan, txn status, rollback, resolve lock)
+      - name: "Project 4C (server: scan, txn status, rollback, resolve lock)"
         run: make project4c

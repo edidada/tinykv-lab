@@ -29,3 +29,15 @@ jobs:
 
       - name: Project 1 (Standalone KV)
         run: make project1
+
+      - name: Project 2A (Raft basic)
+        run: make project2a
+
+      - name: Project 2AA (Leader election)
+        run: make project2aa
+
+      - name: Project 2AB (Log replication)
+        run: make project2ab
+
+      - name: Project 2AC (RawNode)
+        run: make project2ac

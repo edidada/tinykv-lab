@@ -166,6 +166,7 @@ func (d *peerMsgHandler) applyConfChange(cc *eraftpb.ConfChange, kvWB *engine_ut
 		peer = &metapb.Peer{Id: cc.NodeId}
 	}
 
+	removeSelf := false
 	switch cc.ChangeType {
 	case eraftpb.ConfChangeType_AddNode:
 		found := false
@@ -183,19 +184,25 @@ func (d *peerMsgHandler) applyConfChange(cc *eraftpb.ConfChange, kvWB *engine_ut
 	case eraftpb.ConfChangeType_RemoveNode:
 		util.RemovePeer(region, peer.StoreId)
 		if peer.Id == d.PeerId() {
-			// This peer is removed from the group; destroy it after replying.
-			d.destroyPeer()
+			removeSelf = true
 		}
 	}
 	region.RegionEpoch.ConfVer++
 
-	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
-	d.ctx.storeMeta.Lock()
-	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
-	d.ctx.storeMeta.regions[region.Id] = region
-	d.ctx.storeMeta.Unlock()
+	if !removeSelf {
+		meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+		d.ctx.storeMeta.Lock()
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+		d.ctx.storeMeta.regions[region.Id] = region
+		d.ctx.storeMeta.Unlock()
+	}
 
 	d.RaftGroup.ApplyConfChange(*cc)
+
+	if removeSelf {
+		// This peer is removed from the group; destroy it after replying.
+		d.destroyPeer()
+	}
 
 	resp := newCmdResp()
 	clonedRegion := new(metapb.Region)

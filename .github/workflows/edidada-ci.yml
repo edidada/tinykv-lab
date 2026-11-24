@@ -50,3 +50,10 @@ jobs:
         run: go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestOneSnapshot2C$'
       - name: Project 3A (leader transfer and conf change)
         run: go test -v --count=1 --parallel=1 -p=1 ./raft -run 3A
+      - name: Project 3B (conf change)
+        run: |
+          go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestBasicConfChange3B$'
+          go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestTransferLeader3B$'
+
+      - name: Project 3B (split)
+        run: go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestOneSplit3B$'

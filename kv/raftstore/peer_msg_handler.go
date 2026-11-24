@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -71,7 +72,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		for _, entry := range rd.CommittedEntries {
 			switch entry.EntryType {
 			case eraftpb.EntryType_EntryConfChange:
-				// (3B) conf change handling
+				var cc eraftpb.ConfChange
+				if err := cc.Unmarshal(entry.Data); err != nil {
+					log.Errorf("%s unmarshal conf change failed: %v", d.Tag, err)
+					panic(err)
+				}
+				d.notifyStaleProposals(entry.Index)
+				resp := d.applyConfChange(&cc, kvWB)
+				if resp != nil {
+					d.notifyProposal(entry.Index, entry.Term, resp)
+				}
 			case eraftpb.EntryType_EntryNormal:
 				if len(entry.Data) == 0 {
 					// noop entry
@@ -138,6 +148,128 @@ func (d *peerMsgHandler) notifyProposal(index, term uint64, resp *raft_cmdpb.Raf
 	}
 }
 
+// applyConfChange applies a raft config change to the local region metadata.
+func (d *peerMsgHandler) applyConfChange(cc *eraftpb.ConfChange, kvWB *engine_util.WriteBatch) *raft_cmdpb.RaftCmdResponse {
+	region := d.Region()
+	var peer *metapb.Peer
+	if len(cc.Context) > 0 {
+		peer = new(metapb.Peer)
+		if err := peer.Unmarshal(cc.Context); err != nil {
+			log.Errorf("%s unmarshal conf change peer failed: %v", d.Tag, err)
+			peer = nil
+		}
+	}
+	if peer == nil {
+		peer = d.getPeerFromCache(cc.NodeId)
+	}
+	if peer == nil {
+		peer = &metapb.Peer{Id: cc.NodeId}
+	}
+
+	switch cc.ChangeType {
+	case eraftpb.ConfChangeType_AddNode:
+		found := false
+		for _, p := range region.Peers {
+			if p.Id == peer.Id {
+				*p = *peer
+				found = true
+				break
+			}
+		}
+		if !found {
+			region.Peers = append(region.Peers, peer)
+		}
+		d.insertPeerCache(peer)
+	case eraftpb.ConfChangeType_RemoveNode:
+		util.RemovePeer(region, peer.StoreId)
+		if peer.Id == d.PeerId() {
+			// This peer is removed from the group; destroy it after replying.
+			d.destroyPeer()
+		}
+	}
+	region.RegionEpoch.ConfVer++
+
+	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+	d.ctx.storeMeta.regions[region.Id] = region
+	d.ctx.storeMeta.Unlock()
+
+	d.RaftGroup.ApplyConfChange(*cc)
+
+	resp := newCmdResp()
+	clonedRegion := new(metapb.Region)
+	if err := util.CloneMsg(region, clonedRegion); err == nil {
+		resp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+			ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: clonedRegion},
+		}
+	}
+	return resp
+}
+
+// applySplit splits the region at the given key.
+func (d *peerMsgHandler) applySplit(req *raft_cmdpb.SplitRequest, kvWB *engine_util.WriteBatch) (*raft_cmdpb.AdminResponse, error) {
+	region := d.Region()
+	splitKey := req.SplitKey
+	if len(splitKey) == 0 || bytes.Compare(splitKey, region.StartKey) <= 0 ||
+		(len(region.EndKey) != 0 && bytes.Compare(splitKey, region.EndKey) >= 0) {
+		return nil, errors.Errorf("%s invalid split key %x for region %s", d.Tag, splitKey, region)
+	}
+	if len(req.NewPeerIds) != len(region.Peers) {
+		return nil, errors.Errorf("%s peer count mismatch, got %d want %d", d.Tag, len(req.NewPeerIds), len(region.Peers))
+	}
+
+	// Build the new (right) region derived from the current one.
+	newRegion := &metapb.Region{
+		Id:       req.NewRegionId,
+		StartKey: util.SafeCopy(splitKey),
+		EndKey:   util.SafeCopy(region.EndKey),
+		RegionEpoch: &metapb.RegionEpoch{
+			ConfVer: 1,
+			Version: region.RegionEpoch.Version + 1,
+		},
+	}
+	for i, id := range req.NewPeerIds {
+		newRegion.Peers = append(newRegion.Peers, &metapb.Peer{
+			Id:      id,
+			StoreId: region.Peers[i].StoreId,
+		})
+	}
+
+	// Shrink the current (left) region.
+	region.EndKey = util.SafeCopy(splitKey)
+	region.RegionEpoch.Version++
+
+	meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+
+	// Register the new region in the store meta and create a local peer for it.
+	d.ctx.storeMeta.Lock()
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
+	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+	d.ctx.storeMeta.regions[newRegion.Id] = newRegion
+	d.ctx.storeMeta.Unlock()
+
+	d.SetRegion(region)
+
+	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+	if err != nil {
+		return nil, err
+	}
+	// The leader of the old region usually becomes the leader of the new one.
+	if d.IsLeader() {
+		newPeer.MaybeCampaign(true)
+	}
+	d.ctx.router.register(newPeer)
+	_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
+
+	return &raft_cmdpb.AdminResponse{
+		CmdType: raft_cmdpb.AdminCmdType_Split,
+		Split:   &raft_cmdpb.SplitResponse{Regions: []*metapb.Region{region, newRegion}},
+	}, nil
+}
+
 // applyCommand applies a write/admin command to the KV engine and builds its response.
 func (d *peerMsgHandler) applyCommand(req *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch, index, term uint64) *raft_cmdpb.RaftCmdResponse {
 	resp := newCmdResp()
@@ -192,6 +324,11 @@ func (d *peerMsgHandler) applyAdminCommand(req *raft_cmdpb.AdminRequest, kvWB *e
 		}
 		d.ScheduleCompactLog(compactIdx)
 		return &raft_cmdpb.AdminResponse{CmdType: req.CmdType, CompactLog: &raft_cmdpb.CompactLogResponse{}}, nil
+	case raft_cmdpb.AdminCmdType_Split:
+		return d.applySplit(req.Split, kvWB)
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		d.RaftGroup.TransferLeader(req.TransferLeader.Peer.Id)
+		return &raft_cmdpb.AdminResponse{CmdType: req.CmdType, TransferLeader: &raft_cmdpb.TransferLeaderResponse{}}, nil
 	}
 	return nil, errors.Errorf("%s unsupported admin command type %v", d.Tag, req.CmdType)
 }
@@ -265,6 +402,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 
+	if msg.AdminRequest != nil {
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			d.proposeConfChange(msg.AdminRequest.ChangePeer, cb)
+			return
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.GetPeer().GetId())
+			resp := newCmdResp()
+			resp.AdminResponse = &raft_cmdpb.AdminResponse{
+				CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+			}
+			cb.Done(resp)
+			return
+		}
+	}
+
 	// Read commands are served locally without going through raft.
 	if msg.AdminRequest == nil && len(msg.Requests) == 1 {
 		switch msg.Requests[0].CmdType {
@@ -306,6 +460,30 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 
+	if cb != nil {
+		d.proposals = append(d.proposals, &proposal{
+			index: index,
+			term:  d.Term(),
+			cb:    cb,
+		})
+	}
+}
+
+// proposeConfChange turns a ChangePeer admin request into a raft conf change entry.
+func (d *peerMsgHandler) proposeConfChange(cp *raft_cmdpb.ChangePeerRequest, cb *message.Callback) {
+	cc := eraftpb.ConfChange{
+		ChangeType: cp.ChangeType,
+		NodeId:     cp.Peer.GetId(),
+	}
+	if data, err := cp.Peer.Marshal(); err == nil {
+		cc.Context = data
+	}
+
+	index := d.nextProposalIndex()
+	if err := d.RaftGroup.ProposeConfChange(cc); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
 	if cb != nil {
 		d.proposals = append(d.proposals, &proposal{
 			index: index,

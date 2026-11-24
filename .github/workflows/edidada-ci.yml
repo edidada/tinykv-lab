@@ -41,3 +41,5 @@ jobs:
 
       - name: Project 2AC (RawNode)
         run: make project2ac
+      - name: Project 2B (raftstore, TestBasic2B)
+        run: go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestBasic2B$'

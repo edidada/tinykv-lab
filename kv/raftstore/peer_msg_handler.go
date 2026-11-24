@@ -274,23 +274,31 @@ func (d *peerMsgHandler) applySplit(req *raft_cmdpb.SplitRequest, kvWB *engine_u
 
 	// Register the new region in the store meta and create a local peer for it.
 	d.ctx.storeMeta.Lock()
+	_, exists := d.ctx.storeMeta.regions[newRegion.Id]
 	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: region})
-	d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+	if !exists {
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+	}
 	d.ctx.storeMeta.regions[newRegion.Id] = newRegion
 	d.ctx.storeMeta.Unlock()
 
 	d.SetRegion(region)
 
-	newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
-	if err != nil {
-		return nil, err
+	// The peer may already have been created by an incoming raft message
+	// (replicatePeer) before this split entry was applied; in that case do not
+	// create a second peer for the same region.
+	if !exists {
+		newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+		if err != nil {
+			return nil, err
+		}
+		// The leader of the old region usually becomes the leader of the new one.
+		if d.IsLeader() {
+			newPeer.MaybeCampaign(true)
+		}
+		d.ctx.router.register(newPeer)
+		_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
 	}
-	// The leader of the old region usually becomes the leader of the new one.
-	if d.IsLeader() {
-		newPeer.MaybeCampaign(true)
-	}
-	d.ctx.router.register(newPeer)
-	_ = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart})
 
 	return &raft_cmdpb.AdminResponse{
 		CmdType: raft_cmdpb.AdminCmdType_Split,

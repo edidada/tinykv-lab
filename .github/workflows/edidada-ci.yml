@@ -43,3 +43,8 @@ jobs:
         run: make project2ac
       - name: Project 2B (raftstore, TestBasic2B)
         run: go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestBasic2B$'
+      - name: Project 2C (raft snapshot logic)
+        run: go test -v --count=1 --parallel=1 -p=1 ./raft -run 2C
+
+      - name: Project 2C (raftstore snapshot)
+        run: go test -v --count=1 --parallel=1 -p=1 ./kv/test_raftstore -run '^TestOneSnapshot2C$'

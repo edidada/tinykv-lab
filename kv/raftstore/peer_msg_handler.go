@@ -58,6 +58,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if applySnapResult != nil {
 		// The region has been replaced by the snapshot.
 		d.SetRegion(applySnapResult.Region)
+		d.ctx.storeMeta.Lock()
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapResult.Region})
+		d.ctx.storeMeta.regions[applySnapResult.Region.Id] = applySnapResult.Region
+		d.ctx.storeMeta.Unlock()
 	}
 
 	d.Send(d.ctx.trans, rd.Messages)

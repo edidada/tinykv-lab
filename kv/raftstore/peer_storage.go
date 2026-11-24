@@ -349,11 +349,54 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
-	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
-	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	oldRegion := ps.region
+	initialized := ps.isInitialized()
+
+	if initialized {
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// Wipe the stale local metadata and raft logs, still using the old state.
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+
+	// Update the in-memory state to the snapshot.
+	snapMeta := snapshot.GetMetadata()
+	ps.region = snapData.Region
+	ps.applyState.AppliedIndex = snapMeta.Index
+	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{
+		Index: snapMeta.Index,
+		Term:  snapMeta.Term,
+	}
+	if ps.raftState.HardState == nil {
+		ps.raftState.HardState = &eraftpb.HardState{}
+	}
+	ps.raftState.LastIndex = snapMeta.Index
+	ps.raftState.LastTerm = snapMeta.Term
+	ps.raftState.HardState.Commit = snapMeta.Index
+	ps.raftState.HardState.Term = snapMeta.Term
+
+	// The region is normal again after being rebuilt from the snapshot.
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+
+	// Ask the region worker to copy the snapshot data into the KV engine.
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.GetMetadata(),
+		StartKey: oldRegion.GetStartKey(),
+		EndKey:   oldRegion.GetEndKey(),
+	}
+	if ok := <-ch; !ok {
+		return nil, errors.New("failed to apply snapshot")
+	}
+
+	return &ApplySnapResult{
+		PrevRegion: oldRegion,
+		Region:     snapData.Region,
+	}, nil
 }
 
 // Save memory states to disk.

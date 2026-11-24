@@ -72,6 +72,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	d.Send(d.ctx.trans, rd.Messages)
 
 	kvWB := new(engine_util.WriteBatch)
+	type appliedResp struct {
+		index uint64
+		term  uint64
+		resp  *raft_cmdpb.RaftCmdResponse
+	}
+	var responses []appliedResp
 	if len(rd.CommittedEntries) > 0 {
 		for _, entry := range rd.CommittedEntries {
 			switch entry.EntryType {
@@ -84,7 +90,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				d.notifyStaleProposals(entry.Index)
 				resp := d.applyConfChange(&cc, kvWB)
 				if resp != nil {
-					d.notifyProposal(entry.Index, entry.Term, resp)
+					responses = append(responses, appliedResp{entry.Index, entry.Term, resp})
 				}
 			case eraftpb.EntryType_EntryNormal:
 				if len(entry.Data) == 0 {
@@ -99,7 +105,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				d.notifyStaleProposals(entry.Index)
 				resp := d.applyCommand(&cmd, kvWB, entry.Index, entry.Term)
 				if resp != nil {
-					d.notifyProposal(entry.Index, entry.Term, resp)
+					responses = append(responses, appliedResp{entry.Index, entry.Term, resp})
 				}
 			}
 			d.peerStorage.applyState.AppliedIndex = entry.Index
@@ -114,6 +120,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if err := kvWB.WriteToDB(d.ctx.engine.Kv); err != nil {
 		log.Errorf("%s write applied data failed: %v", d.Tag, err)
 		panic(err)
+	}
+
+	// Reply only after the applied data has been flushed, otherwise a client may
+	// read back its own acknowledged write before it is visible.
+	for _, r := range responses {
+		d.notifyProposal(r.index, r.term, r.resp)
 	}
 
 	d.RaftGroup.Advance(rd)

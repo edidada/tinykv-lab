@@ -408,7 +408,29 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		}
 		return errEpochNotMatching
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	// All requests must be in the range of the region, otherwise the router has
+	// dispatched the request to a wrong peer (e.g. after a split).
+	for _, req := range req.Requests {
+		var key []byte
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			key = req.Get.Key
+		case raft_cmdpb.CmdType_Put:
+			key = req.Put.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = req.Delete.Key
+		}
+		if len(key) > 0 {
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {

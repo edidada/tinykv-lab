@@ -33,6 +33,10 @@ const (
 type peerMsgHandler struct {
 	*peer
 	ctx *GlobalContext
+	// pendingDestroy is set when this peer has been removed from its group by a
+	// conf change. The peer is destroyed only after the ready state has been
+	// fully persisted, otherwise its own state would be written back again.
+	pendingDestroy bool
 }
 
 func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
@@ -113,6 +117,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 	d.RaftGroup.Advance(rd)
+
+	if d.pendingDestroy {
+		d.destroyPeer()
+	}
 }
 
 // notifyStaleProposals drops proposals that can never be answered any more.
@@ -200,8 +208,9 @@ func (d *peerMsgHandler) applyConfChange(cc *eraftpb.ConfChange, kvWB *engine_ut
 	d.RaftGroup.ApplyConfChange(*cc)
 
 	if removeSelf {
-		// This peer is removed from the group; destroy it after replying.
-		d.destroyPeer()
+		// This peer is removed from the group; destroy it once the ready state
+		// has been persisted, so its meta keys are not resurrected.
+		d.pendingDestroy = true
 	}
 
 	resp := newCmdResp()

@@ -1,0 +1,31 @@
+name: edidada-ci (tinykv)
+
+# 只监听 edidada/course 分支的专用流水线：编译 + 逐个 project 的 lab 测试
+on:
+  push:
+    branches:
+      - edidada/course
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+      GOPROXY: "https://proxy.golang.org,direct"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.20"
+          cache: true
+
+      - name: Build binaries
+        run: make kv scheduler
+
+      - name: Project 1 (Standalone KV)
+        run: make project1

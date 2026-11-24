@@ -1,5 +1,12 @@
 name: Go
-on: [push,pull_request]
+# 上游流程收敛到原始分支，避免和 edidada 分支专用流程重复触发
+on:
+  push:
+    branches:
+      - course
+  pull_request:
+    branches:
+      - course
 jobs:
 
   build:

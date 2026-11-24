@@ -207,11 +207,9 @@ func newRaft(c *Config) *Raft {
 	for _, id := range members {
 		r.Prs[id] = &Progress{Next: raftLog.LastIndex() + 1}
 	}
-	if _, ok := r.Prs[r.id]; !ok {
-		// A restarted node with an empty conf state still knows itself.
-		r.Prs[r.id] = &Progress{Next: raftLog.LastIndex() + 1}
+	if pr, ok := r.Prs[r.id]; ok {
+		pr.Match = raftLog.LastIndex()
 	}
-	r.Prs[r.id].Match = raftLog.LastIndex()
 
 	if len(r.Prs) == 1 {
 		// single-node cluster: no need to wait for heartbeats
@@ -402,33 +400,35 @@ func (r *Raft) becomeLeader() {
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	// Handle term changes first (except for local, term-less messages).
+	// Handle term changes first (term-less messages are local requests).
 	switch m.MsgType {
-	case pb.MessageType_MsgHup, pb.MessageType_MsgPropose, pb.MessageType_MsgBeat:
+	case pb.MessageType_MsgHup, pb.MessageType_MsgPropose, pb.MessageType_MsgBeat, pb.MessageType_MsgTransferLeader:
 	default:
-		if m.Term < r.Term {
-			// Stale message: refuse and report our own term, but never
-			// modify any state.
-			switch m.MsgType {
-			case pb.MessageType_MsgAppend:
-				r.sendAppendResponse(m.From, false, r.RaftLog.committed)
-			case pb.MessageType_MsgHeartbeat:
-				r.send(pb.Message{
-					MsgType: pb.MessageType_MsgHeartbeatResponse,
-					To:      m.From,
-					Index:   r.RaftLog.committed,
-				})
-			case pb.MessageType_MsgRequestVote:
-				r.send(pb.Message{
-					MsgType: pb.MessageType_MsgRequestVoteResponse,
-					To:      m.From,
-					Reject:  true,
-				})
+		if m.Term != 0 {
+			if m.Term < r.Term {
+				// Stale message: refuse and report our own term, but never
+				// modify any state.
+				switch m.MsgType {
+				case pb.MessageType_MsgAppend:
+					r.sendAppendResponse(m.From, false, r.RaftLog.committed)
+				case pb.MessageType_MsgHeartbeat:
+					r.send(pb.Message{
+						MsgType: pb.MessageType_MsgHeartbeatResponse,
+						To:      m.From,
+						Index:   r.RaftLog.committed,
+					})
+				case pb.MessageType_MsgRequestVote:
+					r.send(pb.Message{
+						MsgType: pb.MessageType_MsgRequestVoteResponse,
+						To:      m.From,
+						Reject:  true,
+					})
+				}
+				return nil
 			}
-			return nil
-		}
-		if m.Term > r.Term {
-			r.becomeFollower(m.Term, None)
+			if m.Term > r.Term {
+				r.becomeFollower(m.Term, None)
+			}
 		}
 	}
 
@@ -494,12 +494,20 @@ func (r *Raft) Step(m pb.Message) error {
 
 	case pb.MessageType_MsgTransferLeader:
 		// (Used in 3A)
-		r.handleTransferLeader(m)
+		if r.State == StateLeader {
+			r.handleTransferLeader(m)
+		} else if r.Lead != None {
+			// forward the request to the leader, keeping the original transferee
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 
 	case pb.MessageType_MsgTimeoutNow:
-		// (Used in 3A)
+		// (Used in 3A) a node that is not a member of the group must not campaign.
 		if r.State == StateFollower {
-			r.campaign()
+			if _, ok := r.Prs[r.id]; ok {
+				r.campaign()
+			}
 		}
 	}
 	return nil
@@ -507,6 +515,10 @@ func (r *Raft) Step(m pb.Message) error {
 
 // campaign starts an election: become candidate, vote for self and ask for votes.
 func (r *Raft) campaign() {
+	// A node that has been removed from the group must never campaign.
+	if _, ok := r.Prs[r.id]; !ok {
+		return
+	}
 	r.becomeCandidate()
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
